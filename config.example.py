@@ -40,6 +40,9 @@ mount_path_prefix_add = ""
 
 # 是否缓存视频前15秒用于起播加速
 enable_cache = False
-cache_path = "/root/EmbyToAlist/cache"
+enable_cache_next_episode = False
+cache_path = "/app/cache"
+# 缓存文件名称黑名单，文件名称包含以下字符串的文件不会被缓存，支持正则表达式
+cache_blacklist = []
 
 log_level = "INFO"

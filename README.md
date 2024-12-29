@@ -15,15 +15,18 @@
 * 根据 Emby 主域名自动选择重定向的后端直链主域名
 * 少少许加快起播速度
 
-2. 开启视频开头缓存
+2. 花费少量本地空间开启视频开头缓存
 
 * 通过本机反向代理后端存储（需消耗本机流量）
 * 无缓存时302重定向到文件直链
 * 初次播放后缓存视频文件开头元数据
 * 大幅加快起播速度
 * 降低播放器开始播放时对后端的请求并发数量
+* 播放剧集时自动缓存下一集
 
 # 部署方式
+
+## 1. 直接部署
 
 ```
 # 克隆项目到本地
@@ -34,6 +37,37 @@ $ pip install -r requirements.txt
 $ cp config.example.py config.py
 # 运行 main.py 启动
 $ python3 main.py
+```
+
+## 2. 通过docker compose部署
+```
+# 获取docker-compose.yml文件 和 配置文件
+$ wget https://raw.githubusercontent.com/zsbai/EmbyToAlist/refs/heads/main/docker-compose.yml -O docker-compose.yml && wget https://raw.githubusercontent.com/zsbai/EmbyToAlist/refs/heads/main/config.example.py -O config.py
+# 配置 docker-compose.yml 中的路径网络
+# 启动
+$ docker compose up -d
+# 更新
+$ docker compose pull && docker compose up -d
+# 删除
+$ docker compose down
+# 查看日志
+$ docker compose logs
+```
+
+示例 docker-compose.yml 文件：
+```
+services:
+  embytoalist:
+    image: ghcr.io/zsbai/embytoalist:latest
+    volumes:
+      - ./config.py:/app/config.py
+      - /path/to/cache_dir:/path/to/cache_dir
+    # host和port二选一，设置为host可以直接通过 127.0.0.1 访问宿主机上的alist和emby服务
+    # 设置为port需要使用docker网关访问宿主机
+    network_mode: host
+    # ports:
+    #   - 127.0.0.1:60001:60001
+    restart: unless-stopped
 ```
 
 启动服务器后，需要配置 Nginx，将播放路径反向代理到本地`60001`端口。
@@ -147,6 +181,7 @@ $ python3 main.py
 
 
 * `enable_cache`：布尔值，是否缓存媒体文件的前15秒进行加速（通过码率计算）。
+* `enable_cache_next_episode`：布尔值，在播放剧集的时候自动缓存下一集
 * `cache_path`：字符串，缓存存放的路径。
 
 
