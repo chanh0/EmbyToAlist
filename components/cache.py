@@ -32,8 +32,8 @@ async def read_file(
     读取文件的指定范围，并返回异步生成器。
    
     :param file_path: 缓存文件路径
-    :param start_point: 文件读取起始点
-    :param end_point: 文件读取结束点，None 表示文件末尾
+    :param start_point: 文件读取起始点，HTTP Range 的字节范围
+    :param end_point: 文件读取结束点，None 表示文件末尾，HTTP Range 的字节范围
     :param chunk_size: 每次读取的字节数，默认为 1MB
     
     :return: 生成器，每次返回 chunk_size 大小的数据
@@ -62,6 +62,8 @@ async def write_cache_file(item_id, request_info: RequestInfo, req_header=None, 
     """
     写入缓存文件，end point通过cache_size计算得出
     
+    缓存文件名格式为 cache_file_{start_point}_{end_point}，start 和 end 都为 HTTP Range 的字节范围（即需-1）
+    
     :param item_id: Emby Item ID
     :param request_info: 请求信息
     :param req_header: 请求头，用于请求Alist Raw Url
@@ -72,24 +74,26 @@ async def write_cache_file(item_id, request_info: RequestInfo, req_header=None, 
     path = request_info.file_info.path
     file_size = request_info.file_info.size
     cache_size = request_info.file_info.cache_file_size
-    start_point = request_info.start_byte
-    host_url = request_info.host_url
     
-    subdirname, dirname = get_hash_subdirectory_from_path(path, request_info.file_info.type)
+    subdirname, dirname = get_hash_subdirectory_from_path(path, request_info.item_info.item_type)
     
     # 计算缓存文件的结束点
     # 如果 start_point 大于 cache_size，endPoint 为文件末尾（将缓存尾部元数据）
-    if request_info.cache_status == CacheStatus.HIT or request_info.cache_status == CacheStatus.PARTIAL:
+    if request_info.cache_status in {CacheStatus.PARTIAL, CacheStatus.HIT}:
         start_point = 0
         end_point = cache_size - 1
     elif request_info.cache_status == CacheStatus.HIT_TAIL:
+        start_point = request_info.start_byte
         end_point = file_size - 1
     else:
-        logger.error(f"Cache Error {start_point}, File Size is None")
-        return
+        logger.error(f"Cache Error {request_info.start_byte}, File Size is None")
+        return False
     
     # 获取Alist Raw Url
-    raw_url = await get_or_cache_alist_raw_url(path, host_url, client)
+    if request_info.raw_url is None:
+        raw_url = await request_info.raw_url_task
+    else:
+        raw_url = request_info.raw_url
     
     # 根据起始点和缓存大小确定缓存文件路径
     cache_file_name = f'cache_file_{start_point}_{end_point}'
@@ -119,7 +123,7 @@ async def write_cache_file(item_id, request_info: RequestInfo, req_header=None, 
                     logger.warning(f"Existing Cache Range within new range. Deleting old cache.")
                     await aiofiles.os.remove(os.path.join(cache_path, subdirname, dirname, file))
         
-        # 请求Alist Raw Url，好像请求头没太所谓
+        # 请求Alist Raw Url，115会验证header中的UA，所以需要传入
         if req_header is None:
             req_header = {}
         else:
@@ -149,8 +153,10 @@ async def write_cache_file(item_id, request_info: RequestInfo, req_header=None, 
         except Exception as e:
             # 错误处理并删除缓存文件和标签文件
             logger.error(f"Write Cache Error {start_point}-{end_point}: {e}")
-            await aiofiles.os.remove(cache_file_path)
-            await aiofiles.os.remove(cache_write_tag_path)
+            if await aiofiles.os.path.exists(cache_file_path):
+                await aiofiles.os.remove(cache_file_path)
+            if await aiofiles.os.path.exists(cache_write_tag_path):
+                await aiofiles.os.remove(cache_write_tag_path)
             return False
 
     
@@ -162,7 +168,7 @@ def read_cache_file(request_info: RequestInfo) -> AsyncGenerator[bytes, None]:
     
     :return: function read_file
     """    
-    subdirname, dirname = get_hash_subdirectory_from_path(request_info.file_info.path, request_info.file_info.type)
+    subdirname, dirname = get_hash_subdirectory_from_path(request_info.file_info.path, request_info.item_info.item_type)
     file_dir = os.path.join(cache_path, subdirname, dirname)
     
     # 查找与 startPoint 匹配的缓存文件，endPoint 为文件名的一部分
@@ -186,7 +192,7 @@ def get_cache_status(request_info: RequestInfo) -> bool:
     
     :param request_info: 请求信息
     """
-    subdirname, dirname = get_hash_subdirectory_from_path(request_info.file_info.path, request_info.file_info.type)
+    subdirname, dirname = get_hash_subdirectory_from_path(request_info.file_info.path, request_info.item_info.item_type)
     cache_dir = os.path.join(cache_path, subdirname, dirname)
     
     if os.path.exists(cache_dir) is False:
@@ -203,8 +209,106 @@ def get_cache_status(request_info: RequestInfo) -> bool:
     for file in os.listdir(cache_dir):
         if file.startswith('cache_file_'):
             range_start, range_end = map(int, file.split('_')[2:4])
-            if range_start <= request_info.start_byte <= range_end:
-                return True
+            if verify_cache_file(request_info.file_info, (range_start, range_end)):
+                if range_start <= request_info.start_byte <= range_end:
+                    return True
+            else:
+                logger.error(f"Get Cache Error: Cache file {file} is invalid, removing..")
+                os.remove(os.path.join(cache_dir, file))
+                return False
     
     logger.error(f"Get Cache Error: Cache file for range {request_info.start_byte} not found.")
     return False
+
+async def cache_next_episode(request_info: RequestInfo, api_key: str, client: httpx.AsyncClient) -> bool:
+    """
+    如果是剧集则缓存下一集；如果是电影则跳过
+    
+    :param request_info: 请求信息
+    :param api_key: Emby API Key
+    :param client: HTTPX异步客户端
+    """
+    if request_info.item_info.item_type != 'episode': 
+        logger.debug(f"Skip caching next episode for non-episode item: {request_info.item_info.item_id}")
+        return False
+    
+    next_episode_id = request_info.item_info.item_id + 1
+    next_item_info = await get_item_info(next_episode_id, api_key, client)
+    # 如果找不到下一集，不缓存；非同季度，不缓存
+    if next_item_info is not None and next_item_info.season_id == request_info.item_info.season_id:
+        next_file_info = await get_file_info(next_item_info.item_id, api_key, media_source_id=None, client=client)
+        for file in next_file_info:
+            next_request_info = RequestInfo(
+                file_info=file,
+                item_info=next_item_info,
+                host_url=request_info.host_url,
+                start_byte=0,
+                end_byte=None,
+                cache_status=CacheStatus.PARTIAL,
+                raw_url_task=asyncio.create_task(
+                    get_or_cache_alist_raw_url(
+                        file_path=file.path, 
+                        host_url=request_info.host_url, 
+                        ua=request_info.headers.get("User-Agent"), 
+                        client=client
+                        )
+                    ),
+            )
+            if get_cache_status(next_request_info):
+                logger.debug(f"Skip caching next episode for existing cache: {next_request_info.item_info.item_id}")
+                return False
+            else:
+                await write_cache_file(next_episode_id, next_request_info, req_header=request_info.headers, client=client)
+        return True
+    
+def verify_cache_file(file_info: FileInfo, cache_file_range: Tuple[int, int]) -> bool:
+    """
+    验证缓存文件是否符合 Emby 文件大小，筛选出错误缓存文件
+    
+    实现方式仅为验证文件大小，不验证文件内容
+    
+    :param file_info: 文件信息
+    :param cache_file_range: 缓存文件的起始点和结束点
+    
+    :return: 缓存文件是否符合视频文件大小
+    """
+    start, end = cache_file_range
+    # 开头缓存文件
+    if start == 0 and end == file_info.cache_file_size - 1:
+        return True
+    # 末尾缓存文件
+    elif end == file_info.size - 1:
+        return True
+    else:
+        return False
+    
+async def clean_cache(file_info: FileInfo, item_info: ItemInfo) -> bool:
+    """
+    根据webhook信息删除缓存文件，及缓存文件夹
+    
+    :param file_info: 文件信息
+    :param item_info: 视频信息
+    
+    :return: bool: 是否删除成功
+    """
+    path = file_info.path
+    subdirname, dirname = get_hash_subdirectory_from_path(path, item_info.item_type)
+    cache_dir = os.path.join(cache_path, subdirname, dirname)
+    lock = get_cache_lock(subdirname, dirname)
+    async with lock:
+        try:
+            for file in os.listdir(cache_dir):
+                if file.startswith('cache_file_'):
+                    await aiofiles.os.remove(os.path.join(cache_dir, file))
+            # 检查文件夹是否为空
+            if not os.listdir(cache_dir):
+                await aiofiles.os.rmdir(cache_dir)
+            else:
+                logger.error(f"Clean Cache Error: Cache directory is not empty: {cache_dir}")
+                raise Exception("Cache directory is not empty")
+            
+            logger.info(f"Clean Cache: {cache_dir}")
+            return True
+        except Exception as e:
+            logger.error(f"Clean Cache Error: {e}")
+            return False

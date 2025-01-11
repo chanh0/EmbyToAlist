@@ -6,8 +6,10 @@ import urllib.parse
 import fastapi
 import httpx
 from uvicorn.server import logger
+from aiolimiter import AsyncLimiter
 
 from config import *
+from components.models import *
 from typing import AsyncGenerator, Tuple
 
 # a wrapper function to get the time of the function
@@ -37,7 +39,7 @@ def get_content_type(container) -> str:
     # 返回对应的Content-Type，如果未找到，返回一个默认值
     return content_types.get(container.lower(), 'application/octet-stream')
 
-def get_hash_subdirectory_from_path(file_path, media_type) -> tuple:
+def get_hash_subdirectory_from_path(file_path, media_type) -> Tuple[str, str]:
     """
     计算给定文件路径的MD5哈希，并返回哈希值的前两位作为子目录名称。
     电影：只计算视频文件本身的上层文件夹路径
@@ -117,7 +119,7 @@ def extract_api_key(request: fastapi.Request):
                 api_key = match_token.group(1)
     return api_key or emby_key
 
-async def get_alist_raw_url(file_path, host_url, client: httpx.AsyncClient) -> str:
+async def get_alist_raw_url(file_path, host_url, ua, client: httpx.AsyncClient) -> str:
     """根据文件路径获取Alist Raw Url"""
     
     alist_api_url = f"{alist_server}/api/fs/get"
@@ -131,13 +133,21 @@ async def get_alist_raw_url(file_path, host_url, client: httpx.AsyncClient) -> s
         "Content-Type": "application/json;charset=UTF-8"
     }
     
+    if ua is not None:
+        header['User-Agent'] = ua
+    
     try:
         req = await client.post(alist_api_url, json=body, headers=header)
         req.raise_for_status()
         req = req.json()
+    except httpx.ReadTimeout:
+        logger.error("Alist server response timeout, please check your network connectivity to Alist server")
+        raise fastapi.HTTPException(status_code=500, detail="Alist server response timeout")
     except Exception as e:
         logger.error(f"Error: get_alist_raw_url failed, {e}")
-        return ('Alist Server Error', 500)
+        logger.error(f"Alist Server Return a {req.status_code} Error")
+        logger.error(f"info: {req.text}")
+        raise fastapi.HTTPException(status_code=500, detail="Failed to request Alist server, {e}")
     
     code = req['code']
     
@@ -177,28 +187,104 @@ async def get_alist_raw_url(file_path, host_url, client: httpx.AsyncClient) -> s
         logger.error(f"Error: {req['message']}")
         # return 500, req['message']        
         raise fastapi.HTTPException(status_code=500, detail="Alist Server Error")
+    
+# used to get the file info from emby server
+async def get_file_info(item_id, api_key, media_source_id, client: httpx.AsyncClient) -> FileInfo:
+    """
+    从Emby服务器获取文件信息
+    
+    :param item_id: Emby Item ID
+    :param MediaSourceId: Emby MediaSource ID
+    :param apiKey: Emby API Key
+    :return: 包含文件信息的字典
+    """
+    media_info_api = f"{emby_server}/emby/Items/{item_id}/PlaybackInfo?MediaSourceId={media_source_id}&api_key={api_key}"
+    logger.info(f"Requested Info URL: {media_info_api}")
+    try:
+        media_info = await client.get(media_info_api)
+        media_info.raise_for_status()
+        media_info = media_info.json()
+    except Exception as e:
+        logger.error(f"Error: failed to request Emby server, {e}")
+        raise fastapi.HTTPException(status_code=500, detail=f"Failed to request Emby server, {e}")
+
+    if media_source_id is None:
+        all_source = []
+        for i in media_info['MediaSources']:
+            all_source.append(FileInfo(
+                path=transform_file_path(i.get('Path')),
+                bitrate=i.get('Bitrate', 27962026),
+                size=i.get('Size', 0),
+                container=i.get('Container', None),
+                # 获取15秒的缓存文件大小， 并取整
+                cache_file_size=int(i.get('Bitrate', 27962026) / 8 * 15)
+            ))
+        return all_source
+
+    for i in media_info['MediaSources']:
+        if i['Id'] == media_source_id:
+            return FileInfo(
+                path=transform_file_path(i.get('Path')),
+                bitrate=i.get('Bitrate', 27962026),
+                size=i.get('Size', 0),
+                container=i.get('Container', None),
+                # 获取15秒的缓存文件大小， 并取整
+                cache_file_size=int(i.get('Bitrate', 27962026) / 8 * 15)
+            )
+    # can't find the matched MediaSourceId in MediaSources
+    raise fastapi.HTTPException(status_code=500, detail="Can't match MediaSourceId")
+    
+
+async def get_item_info(item_id, api_key, client) -> ItemInfo:
+    item_info_api = f"{emby_server}/emby/Items?api_key={api_key}&Ids={item_id}"
+    logger.debug(f"Requesting Item Info: {item_info_api}")
+    try:
+        req = await client.get(item_info_api)
+        req.raise_for_status()
+        req = req.json()
+    except Exception as e:
+        logger.error(f"Error: get_item_info failed, {e}")
+        raise fastapi.HTTPException(status_code=500, detail="Failed to request Emby server, {e}")
+    
+    if not req['Items']: 
+        logger.debug(f"Item not found: {item_id};")
+        return None
+    
+    item_type = req['Items'][0]['Type'].lower()
+    if item_type != 'movie': item_type = 'episode'
+    season_id = int(req['Items'][0]['SeasonId']) if item_type == 'episode' else None
+
+    return ItemInfo(
+        item_id=int(item_id),
+        item_type=item_type,
+        season_id=season_id
+    )
 
 async def reverse_proxy(cache: AsyncGenerator[bytes, None],
                         url_task: str,
                         request_header: dict,
                         response_headers: dict,
-                        client: httpx.AsyncClient
+                        client: httpx.AsyncClient,
+                        status_code: int = 206
                         ):
     """
     读取缓存数据和URL，返回合并后的流
 
     :param cache: 缓存数据
-    :param url_task: 源文件的URL
-    :param request_header: 请求头，用于请求网盘，包含host和range
+    :param url_task: 源文件的URL的异步任务
+    :param request_header: 请求头，用于请求直链，包含host和range
     :param response_headers: 返回的响应头，包含调整过的range以及content-type
     :param client: HTTPX异步客户端
+    :param status_code: HTTP响应状态码，默认为206
     
     :return: fastapi.responses.StreamingResponse
     """
-    try:
-        async def merged_stream():
+    limiter = AsyncLimiter(10*1024*1024, 1)
+    async def merged_stream():
+        try:
             if cache is not None:
                 async for chunk in cache:
+                    await limiter.acquire(len(chunk))
                     yield chunk
                 logger.info("Cache exhausted, streaming from source")
             raw_url = await url_task
@@ -206,16 +292,40 @@ async def reverse_proxy(cache: AsyncGenerator[bytes, None],
             request_header['host'] = raw_url.split('/')[2]
             async with client.stream("GET", raw_url, headers=request_header) as response:
                 response.raise_for_status()
-                if response.status_code != 206:
+                if status_code == 206 and response.status_code != 206:
                     raise ValueError(f"Expected 206 response, got {response.status_code}")
-                # Update response headers with source response headers
-                for key in ["Content-Length", "Content-Range"]:
-                    if key in response.headers:
-                        response_headers[key] = response.headers[key]
                 async for chunk in response.aiter_bytes():
+                    await limiter.acquire(len(chunk))
                     yield chunk
+        except Exception as e:
+            logger.error(f"Reverse_proxy failed, {e}")
+            raise fastapi.HTTPException(status_code=500, detail="Reverse Proxy Failed")
 
-        return fastapi.responses.StreamingResponse(merged_stream(), headers=response_headers, status_code=206)
-    except Exception as e:
-        logger.error(f"Reverse_proxy failed, {e}")
-        raise fastapi.HTTPException(status_code=500, detail="Reverse Proxy Failed")
+    return fastapi.responses.StreamingResponse(
+        merged_stream(), 
+        headers=response_headers, 
+        status_code=status_code
+        )
+
+def validate_regex(word: str) -> bool:
+    """
+    验证用户输入是否为有效的正则表达式
+    """
+    try:
+        re.compile(word)
+        return True
+    except re.error:
+        return False
+
+def match_with_regex(pattern, target_string):
+    """
+    使用正则表达式匹配目标字符串
+    """
+    if validate_regex(pattern):
+        match = re.search(pattern, target_string)
+        if match:
+            return True
+        else:
+            return False
+    else:
+        raise ValueError("Invalid regex pattern")
